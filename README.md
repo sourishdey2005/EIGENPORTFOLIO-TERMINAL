@@ -74,7 +74,7 @@ Notes:
 - **Blank/white Plotly charts** (especially in 3D): reduce simultaneous 3D renders (use Single render mode), or reduce **3D assets (max)**.
 - **Gemini says missing key**: ensure `GEMINI_API_KEY` is set, or create `Eigenportfolio/files/.env` from `.env.example` and restart Streamlit.
 - **After updating the app, you see strange runtime errors**: clear Streamlit cache (`streamlit cache clear`) and restart the app.
-- **Deployments fail to fetch data**: set **Data Source → Demo (Synthetic)** (recommended for locked-down hosts), or reduce **Max Stocks (Fetch)** and keep **Fetch Delay (sec)** at ~2s to avoid Yahoo Finance rate-limits.
+- **Deployments fail to fetch data**: set **Data Source → Demo (Synthetic)** (recommended for locked-down hosts), or reduce **Max Stocks (Fetch)** and keep **Fetch Delay (sec)** at ~2s to avoid data-provider rate-limits (Yahoo / Alpha Vantage).
 - **Dependency issues**: re-run `pip install -r requirements.txt` in a clean virtual environment.
 
 ## Disclaimer

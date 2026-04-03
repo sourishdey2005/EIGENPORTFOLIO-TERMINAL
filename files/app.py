@@ -419,13 +419,13 @@ with st.sidebar:
     )
     selected_tickers = [universe_dict[n] for n in selected_names] if selected_names else [universe_dict[n] for n in default_names[:15]]
 
-    # Deployment-safe fetch limit (Yahoo Finance is rate-limited/unreliable at scale)
+    # Deployment-safe fetch limit (Yahoo/Alpha Vantage are rate-limited in many environments)
     max_fetch_tickers = st.slider(
         "Max Stocks (Fetch)",
         5,
         10,
         5,
-        help="Limits how many tickers are fetched from Yahoo Finance per run (recommended for deployments).",
+        help="Limits how many tickers are fetched from market data providers per run (recommended for deployments).",
     )
 
     # Compare up to 10 stocks

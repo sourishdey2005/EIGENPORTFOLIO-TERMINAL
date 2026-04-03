@@ -4,6 +4,8 @@ Fetches, cleans, and prepares stock data for RMT and portfolio analysis.
 Supports S&P 500 and NIFTY 50 universes with configurable timeframes.
 """
 
+import os
+from pathlib import Path
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -271,6 +273,30 @@ def _period_to_start(period: str, end: pd.Timestamp) -> pd.Timestamp:
     return end - pd.DateOffset(years=1)
 
 
+def _load_dotenv_if_present() -> None:
+    """
+    Lightweight .env loader (no external dependency).
+    Loads environment variables from `Eigenportfolio/files/.env` (this file's folder),
+    without overwriting already-set variables (deployment-safe).
+    """
+    env_path = Path(__file__).resolve().with_name(".env")
+    if not env_path.exists():
+        return
+
+    try:
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and value and not os.getenv(key):
+                os.environ[key] = value
+    except Exception:
+        return
+
+
 def _stooq_symbols(ticker: str) -> list[str]:
     """
     Return candidate Stooq symbols for a given ticker.
@@ -343,6 +369,100 @@ def _fetch_single_stooq(
     return None
 
 
+def _fetch_single_alpha_vantage(
+    session: requests.Session,
+    ticker: str,
+    period: str,
+    interval: str,
+    api_key: str,
+    timeout: int = 25,
+) -> pd.Series | None:
+    """
+    Fetch adjusted close prices for a ticker from Alpha Vantage.
+
+    Free tier is rate-limited (typically 5 calls/minute). This function is best-effort and will
+    return None on rate-limits or unsupported symbols.
+    """
+    api_key = (api_key or "").strip()
+    if not api_key:
+        return None
+
+    interval = (interval or "1d").lower()
+    if interval == "1wk":
+        fn = "TIME_SERIES_WEEKLY_ADJUSTED"
+        ts_key = "Weekly Adjusted Time Series"
+        price_key_candidates = ["5. adjusted close", "4. close"]
+    else:
+        fn = "TIME_SERIES_DAILY_ADJUSTED"
+        ts_key = "Time Series (Daily)"
+        price_key_candidates = ["5. adjusted close", "4. close"]
+
+    try:
+        r = session.get(
+            "https://www.alphavantage.co/query",
+            params={
+                "function": fn,
+                "symbol": ticker,
+                "apikey": api_key,
+                "outputsize": "compact",
+            },
+            timeout=timeout,
+        )
+        if r.status_code != 200:
+            return None
+        payload = r.json()
+    except Exception:
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("Note") or payload.get("Error Message") or payload.get("Information"):
+        return None
+
+    ts = payload.get(ts_key)
+    if not isinstance(ts, dict) or not ts:
+        return None
+
+    rows: list[tuple[pd.Timestamp, float]] = []
+    for d, fields in ts.items():
+        if not isinstance(fields, dict):
+            continue
+        val = None
+        for k in price_key_candidates:
+            if k in fields:
+                val = fields.get(k)
+                break
+        if val is None:
+            continue
+        try:
+            dt = pd.to_datetime(d, errors="coerce")
+            if pd.isna(dt):
+                continue
+            px = float(val)
+        except Exception:
+            continue
+        rows.append((dt, px))
+
+    if not rows:
+        return None
+
+    rows.sort(key=lambda x: x[0])
+    idx = [x[0] for x in rows]
+    vals = [x[1] for x in rows]
+    s = pd.Series(vals, index=idx, name=ticker).dropna()
+
+    if s.empty:
+        return None
+
+    end = pd.to_datetime(s.index.max())
+    start = _period_to_start(period, end)
+    s = s[s.index >= start]
+    if s.dropna().shape[0] < 10:
+        return None
+
+    return s
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def generate_demo_prices(
     tickers: list[str],
@@ -390,6 +510,8 @@ def fetch_price_data(
     interval: str = "1d",
     sleep_seconds: float = 2.0,
     allow_stooq_fallback: bool = True,
+    allow_alpha_vantage_fallback: bool = True,
+    max_alpha_calls: int = 5,
 ) -> tuple[pd.DataFrame, dict]:
     """
     Fetch adjusted closing prices for a list of tickers.
@@ -398,6 +520,9 @@ def fetch_price_data(
       - df: DataFrame with tickers as columns, dates as index
       - report: metadata about the fetch attempt (method, failures, etc.)
     """
+    _load_dotenv_if_present()
+    alpha_key = (os.getenv("ALPHAVANTAGE_API_KEY") or "").strip()
+
     tickers = [t for t in tickers if t]
     ticker_map = {t.replace("&", "%26"): t for t in tickers}
     tickers_yf = list(ticker_map.keys())
@@ -421,6 +546,8 @@ def fetch_price_data(
 
     results: dict[str, pd.Series] = {}
     failed: list[str] = []
+    used_yf: set[str] = set()
+    used_av: set[str] = set()
 
     for i, t_yf in enumerate(tickers_yf):
         t_original = ticker_map.get(t_yf, t_yf)
@@ -459,10 +586,36 @@ def fetch_price_data(
             failed.append(t_original)
         else:
             results[t_original] = series
+            used_yf.add(t_original)
 
         # critical: slow down to reduce rate-limits in deployments
         if sleep_seconds and i < len(tickers_yf) - 1:
             time.sleep(float(sleep_seconds))
+
+    # Alpha Vantage fallback for the tickers that Yahoo couldn't fetch.
+    # Uses env var `ALPHAVANTAGE_API_KEY` (optionally loaded from `Eigenportfolio/files/.env`).
+    if allow_alpha_vantage_fallback and alpha_key and failed:
+        # Free-tier safety: cap requests to avoid long waits / hard rate limits.
+        alpha_targets = list(dict.fromkeys(failed))[: max(0, int(max_alpha_calls))]
+        alpha_delay = max(float(sleep_seconds or 0.0), 12.5)
+        alpha_failed: list[str] = []
+
+        for i, t in enumerate(alpha_targets):
+            s = _fetch_single_alpha_vantage(session, t, period=period, interval=interval, api_key=alpha_key)
+            if s is None:
+                alpha_failed.append(t)
+            else:
+                results[t] = s
+                used_av.add(t)
+            if alpha_delay and i < len(alpha_targets) - 1:
+                time.sleep(float(alpha_delay))
+
+        # Refresh failed list: any ticker still missing in results remains failed (includes not-attempted due to cap).
+        failed = [t for t in tickers if t not in results]
+        report["alpha_vantage_attempted"] = alpha_targets
+        report["alpha_vantage_used"] = sorted(list(used_av))
+        report["alpha_vantage_rate_limit_safe_delay_sec"] = float(alpha_delay)
+        report["alpha_vantage_failed"] = alpha_failed
 
     if not results:
         # Stooq fallback (no API key) for deployments where Yahoo is blocked
@@ -505,7 +658,12 @@ def fetch_price_data(
     df = df.loc[:, df.isna().mean() < 0.30]
     df = df.ffill().bfill()
 
-    report["method"] = "download_single"
+    if used_yf and used_av:
+        report["method"] = "download_single+alpha_vantage"
+    elif used_av and not used_yf:
+        report["method"] = "alpha_vantage"
+    else:
+        report["method"] = "download_single"
     report["n_ok"] = int(df.shape[1])
     report["failed"] = failed
     return df, report
