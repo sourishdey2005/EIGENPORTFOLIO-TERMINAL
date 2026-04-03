@@ -81,6 +81,15 @@ st.set_page_config(
 )
 
 # ─── Module Imports ───────────────────────────────────────────────────────────
+# Cache schema (prevents stale `st.cache_data` values after deploys)
+CACHE_SCHEMA_VERSION = 2
+if st.session_state.get("cache_schema_version") != CACHE_SCHEMA_VERSION:
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
+    st.session_state["cache_schema_version"] = CACHE_SCHEMA_VERSION
+
 from data import (
     fetch_price_data, compute_log_returns, normalize_returns,
     get_rolling_volatility, get_universe_dict, get_sector,
@@ -493,10 +502,32 @@ def load_data():
     all_needed = list(set(selected_tickers + compare_tickers))
     
     with st.spinner("Fetching market data..."):
-        prices_all = fetch_price_data(all_needed, period=period, interval=interval)
+        result = fetch_price_data(all_needed, period=period, interval=interval)
+        if isinstance(result, tuple) and len(result) == 2:
+            prices_all, fetch_report = result
+        else:
+            prices_all = result
+            try:
+                fetched_cols = set(getattr(prices_all, "columns", []))
+            except Exception:
+                fetched_cols = set()
+            fetch_report = {
+                "method": "legacy_cache_df",
+                "n_requested": len(all_needed),
+                "n_ok": len(fetched_cols) if fetched_cols else 0,
+                "failed": [t for t in all_needed if t not in fetched_cols],
+            }
+        st.session_state["fetch_report"] = fetch_report
 
     if prices_all.empty:
-        st.error("❌ Failed to fetch data. Check your tickers and internet connection.")
+        rep = st.session_state.get("fetch_report") or {}
+        failed = rep.get("failed") or []
+        method = rep.get("method") or "unknown"
+        st.error("❌ Failed to fetch market data from Yahoo Finance.")
+        st.caption(f"Fetch method: `{method}` | Requested: {rep.get('n_requested')} | Fetched: {rep.get('n_ok')}")
+        if failed:
+            st.caption("Failed tickers (sample): " + ", ".join([str(x) for x in failed[:10]]))
+        st.info("If this is a deployment: outbound access/rate-limits can block Yahoo Finance. Try fewer tickers, switch to Weekly, or re-run later.")
         return False
 
     # Portfolio universe prices/returns

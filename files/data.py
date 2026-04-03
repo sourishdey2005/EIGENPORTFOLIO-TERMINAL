@@ -9,6 +9,8 @@ import pandas as pd
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import streamlit as st
+import time
+import requests
 
 # ─── Universe Definitions ───────────────────────────────────────────────────
 
@@ -261,11 +263,81 @@ def fetch_price_data(
     tickers: list[str],
     period: str = "1y",
     interval: str = "1d",
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, dict]:
     """
-    Parallel fetch of adjusted closing prices for a list of tickers.
-    Returns a DataFrame with tickers as columns, dates as index.
+    Fetch adjusted closing prices for a list of tickers.
+
+    Returns (df, report):
+      - df: DataFrame with tickers as columns, dates as index
+      - report: metadata about the fetch attempt (method, failures, etc.)
     """
+    tickers = [t for t in tickers if t]
+    ticker_map = {t.replace("&", "%26"): t for t in tickers}
+    tickers_yf = list(ticker_map.keys())
+    report: dict = {"method": None, "n_requested": len(tickers), "n_ok": 0, "failed": []}
+
+    if not tickers_yf:
+        report["method"] = "empty"
+        return pd.DataFrame(), report
+
+    # Prefer a single batch call in deployments to avoid many concurrent connections.
+    session = requests.Session()
+    session.headers.update(
+        {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/123.0.0.0 Safari/537.36"
+            )
+        }
+    )
+
+    for attempt in range(2):
+        try:
+            data = yf.download(
+                tickers=tickers_yf,
+                period=period,
+                interval=interval,
+                auto_adjust=True,
+                group_by="column",
+                threads=True,
+                progress=False,
+                timeout=20,
+                session=session,
+            )
+
+            if data is None or getattr(data, "empty", True):
+                raise RuntimeError("yfinance.download returned empty data")
+
+            if isinstance(data.columns, pd.MultiIndex):
+                if "Close" not in data.columns.get_level_values(0):
+                    raise RuntimeError("yfinance.download missing Close columns")
+                close = data["Close"].copy()
+            else:
+                if "Close" not in data.columns:
+                    raise RuntimeError("yfinance.download missing Close column")
+                close = data[["Close"]].copy()
+                close.columns = [tickers_yf[0]]
+
+            # rename back to original tickers
+            close = close.rename(columns={k: v for k, v in ticker_map.items() if k in close.columns})
+
+            close.index = pd.to_datetime(close.index)
+            close = close.sort_index()
+            close = close.loc[:, close.isna().mean() < 0.30]
+            close = close.ffill().bfill()
+
+            report["method"] = "download"
+            report["n_ok"] = int(close.shape[1])
+            report["failed"] = [t for t in tickers if t not in close.columns]
+
+            return close, report
+        except Exception as e:
+            report["method"] = f"download_failed:{type(e).__name__}"
+            if attempt == 0:
+                time.sleep(0.75)
+                continue
+
     results = {}
     with ThreadPoolExecutor(max_workers=min(20, len(tickers))) as ex:
         futures = {ex.submit(_fetch_single, t, period, interval): t for t in tickers}
@@ -275,14 +347,20 @@ def fetch_price_data(
                 results[ticker] = series
 
     if not results:
-        return pd.DataFrame()
+        report["method"] = report["method"] or "single"
+        report["n_ok"] = 0
+        report["failed"] = list(tickers)
+        return pd.DataFrame(), report
 
     df = pd.DataFrame(results)
     df.index = pd.to_datetime(df.index)
     df = df.sort_index()
     df = df.loc[:, df.isna().mean() < 0.30]          # drop columns with >30% NaN
     df = df.ffill().bfill()
-    return df
+    report["method"] = "single"
+    report["n_ok"] = int(df.shape[1])
+    report["failed"] = [t for t in tickers if t not in df.columns]
+    return df, report
 
 
 @st.cache_data(ttl=300, show_spinner=False)
