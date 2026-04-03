@@ -15,6 +15,7 @@ import itertools
 import json
 import hashlib
 import time
+import gc
 
 _PLOTLY_CHART_COUNTER = itertools.count()
 
@@ -474,9 +475,9 @@ with st.sidebar:
     research_mode = st.toggle("Research Mode", value=False)
     auto_insights = st.toggle("Auto Insights", value=True)
     auto_fetch_on_change = st.toggle("Auto Fetch on Change", value=True)
-    fetch_delay_sec = st.slider("Fetch Delay (sec)", 0.0, 3.0, 2.0, step=0.5, help="Sleep between Yahoo requests to reduce rate-limits.")
-    run_mc = st.toggle("Monte Carlo Simulation", value=True)
-    n_mc = st.slider("MC Simulations", 500, 5000, 2000, step=500) if run_mc else 2000
+    fetch_delay_sec = st.slider("Fetch Delay (sec)", 0.0, 3.0, 0.5, step=0.5, help="Sleep between Yahoo requests to reduce rate-limits.")
+    run_mc = st.toggle("Monte Carlo Simulation", value=False)
+    n_mc = st.slider("MC Simulations", 500, 5000, 1000, step=500) if run_mc else 1000
 
     st.markdown("---")
     fetch_btn = _button(st, "🚀  FETCH & ANALYZE", use_container_width=True)
@@ -509,6 +510,9 @@ for key in ["prices", "returns", "rmt_result", "backtest_results", "frontier", "
 
 def load_data():
     """Fetch and process all data. Updates session state."""
+    # Force garbage collection to prevent Streamlit Cloud Out-Of-Memory (OOM) errors
+    gc.collect()
+
     # Ordered + capped list for deployment stability
     all_needed = []
     for t in list(selected_tickers) + list(compare_tickers):
@@ -524,7 +528,7 @@ def load_data():
             period=period,
             interval=interval,
             sleep_seconds=float(fetch_delay_sec),
-            allow_stooq_fallback=False,
+            allow_stooq_fallback=True,
             allow_alpha_vantage_fallback=True,
             max_alpha_calls=int(max_fetch_tickers),
         )
@@ -544,6 +548,10 @@ def load_data():
             }
 
         st.session_state["fetch_report"] = fetch_report
+
+        # Detect demo fallback and notify user
+        if fetch_report.get("method") == "demo_fallback":
+            st.warning("📊 Using generated demo data (market data unavailable). Configure API keys in sidebar for live data.")
 
     if getattr(prices_all, "empty", True):
         rep = st.session_state.get("fetch_report") or {}
