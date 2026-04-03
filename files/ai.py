@@ -30,7 +30,7 @@ def _load_dotenv_if_present() -> None:
         return
 
 
-def gemini_generate(prompt: str, model: str = "gemini-3-flash-preview") -> str:
+def gemini_generate(prompt: str, model: str = "gemini-3.1-flash-lite-preview") -> str:
     """
     Generate text using Gemini via the `google-genai` SDK.
 
