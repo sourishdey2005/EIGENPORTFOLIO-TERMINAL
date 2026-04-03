@@ -511,7 +511,7 @@ def fetch_price_data(
     sleep_seconds: float = 2.0,
     allow_stooq_fallback: bool = True,
     allow_alpha_vantage_fallback: bool = True,
-    max_alpha_calls: int = 5,
+    max_alpha_calls: int = 10,
 ) -> tuple[pd.DataFrame, dict]:
     """
     Fetch adjusted closing prices for a list of tickers.
@@ -618,7 +618,7 @@ def fetch_price_data(
         report["alpha_vantage_failed"] = alpha_failed
 
     if not results:
-        # Stooq fallback (no API key) for deployments where Yahoo is blocked
+        # Optional tertiary fallback retained for non-deployment local runs.
         if allow_stooq_fallback:
             stooq_results: dict[str, pd.Series] = {}
             stooq_failed: list[str] = []
