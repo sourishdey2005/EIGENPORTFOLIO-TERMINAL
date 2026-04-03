@@ -11,6 +11,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import streamlit as st
 import time
 import requests
+from datetime import datetime
+import io
 
 # ─── Universe Definitions ───────────────────────────────────────────────────
 
@@ -258,11 +260,136 @@ def _fetch_single(ticker: str, period: str, interval: str) -> tuple[str, pd.Seri
         return ticker, None
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+def _period_to_start(period: str, end: pd.Timestamp) -> pd.Timestamp:
+    try:
+        if period.endswith("mo"):
+            return end - pd.DateOffset(months=int(period[:-2]))
+        if period.endswith("y"):
+            return end - pd.DateOffset(years=int(period[:-1]))
+    except Exception:
+        pass
+    return end - pd.DateOffset(years=1)
+
+
+def _stooq_symbols(ticker: str) -> list[str]:
+    """
+    Return candidate Stooq symbols for a given ticker.
+
+    Stooq uses lowercase and exchange suffixes like `.us`.
+    This is best-effort; if it fails we fall back to demo data.
+    """
+    t = (ticker or "").strip()
+    if not t:
+        return []
+
+    # NIFTY (best-effort): RELIANCE.NS -> reliance.in
+    if t.upper().endswith(".NS"):
+        base = t[:-3]
+        return [f"{base.lower()}.in"]
+
+    # US: AAPL -> aapl.us
+    base = t.lower()
+    candidates = [
+        f"{base}.us",
+        f"{base.replace('-', '.')}.us",
+        f"{base.replace('.', '-')}.us",
+    ]
+    # de-dupe while preserving order
+    out = []
+    for c in candidates:
+        if c not in out:
+            out.append(c)
+    return out
+
+
+def _fetch_single_stooq(
+    session: requests.Session,
+    ticker: str,
+    period: str,
+    interval: str,
+    timeout: int = 20,
+) -> pd.Series | None:
+    """
+    Fetch close prices for a single ticker from Stooq (CSV endpoint).
+    """
+    i_map = {"1d": "d", "1wk": "w"}
+    i = i_map.get(interval, "d")
+    for sym in _stooq_symbols(ticker):
+        try:
+            url = f"https://stooq.com/q/d/l/?s={sym}&i={i}"
+            r = session.get(url, timeout=timeout)
+            if r.status_code != 200 or not r.text or "No data" in r.text:
+                continue
+            df = pd.read_csv(io.StringIO(r.text))
+            if df.empty or "Date" not in df.columns:
+                continue
+            df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+            df = df.dropna(subset=["Date"]).sort_values("Date")
+            col = "Close" if "Close" in df.columns else ("Adj Close" if "Adj Close" in df.columns else None)
+            if col is None:
+                continue
+
+            s = pd.Series(df[col].values, index=df["Date"], name=ticker).dropna()
+            if s.empty:
+                continue
+            end = pd.to_datetime(s.index.max())
+            start = _period_to_start(period, end)
+            s = s[s.index >= start]
+            if s.dropna().shape[0] < 10:
+                continue
+            return s
+        except Exception:
+            continue
+    return None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def generate_demo_prices(
+    tickers: list[str],
+    period: str = "1y",
+    interval: str = "1d",
+    seed: int = 7,
+) -> pd.DataFrame:
+    """
+    Deterministic demo price series when market data providers are unavailable.
+    """
+    tickers = [t for t in (tickers or []) if t]
+    if not tickers:
+        return pd.DataFrame()
+
+    if interval == "1wk":
+        dates = pd.date_range(end=pd.Timestamp.utcnow().normalize(), periods=260, freq="W-FRI")
+    else:
+        dates = pd.bdate_range(end=pd.Timestamp.utcnow().normalize(), periods=260)
+
+    # Trim to period
+    end = dates.max()
+    start = _period_to_start(period, end)
+    dates = dates[dates >= start]
+
+    rng = np.random.default_rng(seed)
+    df = pd.DataFrame(index=dates)
+    # keep bounded for UI responsiveness, but allow universes + comparisons
+    for i, t in enumerate(tickers[:60]):
+        # stagger per ticker for uniqueness
+        local = np.random.default_rng(seed + i * 11)
+        mu = 0.10 + 0.02 * (i % 5)      # drift
+        sigma = 0.18 + 0.03 * (i % 7)   # vol
+        dt = 1 / 252
+        shocks = local.normal(0, 1, size=len(dates))
+        lr = (mu - 0.5 * sigma**2) * dt + sigma * np.sqrt(dt) * shocks
+        price = 100 * np.exp(np.cumsum(lr))
+        df[t] = price
+    return df
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_price_data(
     tickers: list[str],
     period: str = "1y",
     interval: str = "1d",
+    sleep_seconds: float = 2.0,
+    allow_stooq_fallback: bool = True,
 ) -> tuple[pd.DataFrame, dict]:
     """
     Fetch adjusted closing prices for a list of tickers.
@@ -280,7 +407,7 @@ def fetch_price_data(
         report["method"] = "empty"
         return pd.DataFrame(), report
 
-    # Prefer a single batch call in deployments to avoid many concurrent connections.
+    # Prefer single-ticker fetches in deployments (reduces partial/missing data issues).
     session = requests.Session()
     session.headers.update(
         {
@@ -292,74 +419,95 @@ def fetch_price_data(
         }
     )
 
-    for attempt in range(2):
-        try:
-            data = yf.download(
-                tickers=tickers_yf,
-                period=period,
-                interval=interval,
-                auto_adjust=True,
-                group_by="column",
-                threads=True,
-                progress=False,
-                timeout=20,
-                session=session,
-            )
+    results: dict[str, pd.Series] = {}
+    failed: list[str] = []
 
-            if data is None or getattr(data, "empty", True):
-                raise RuntimeError("yfinance.download returned empty data")
+    for i, t_yf in enumerate(tickers_yf):
+        t_original = ticker_map.get(t_yf, t_yf)
+        series = None
 
-            if isinstance(data.columns, pd.MultiIndex):
-                if "Close" not in data.columns.get_level_values(0):
-                    raise RuntimeError("yfinance.download missing Close columns")
-                close = data["Close"].copy()
-            else:
-                if "Close" not in data.columns:
-                    raise RuntimeError("yfinance.download missing Close column")
-                close = data[["Close"]].copy()
-                close.columns = [tickers_yf[0]]
+        for attempt in range(2):
+            try:
+                data = yf.download(
+                    t_yf,
+                    period=period,
+                    interval=interval,
+                    auto_adjust=True,
+                    progress=False,
+                    threads=False,
+                    timeout=20,
+                    session=session,
+                )
+                if data is None or getattr(data, "empty", True):
+                    raise RuntimeError("empty")
 
-            # rename back to original tickers
-            close = close.rename(columns={k: v for k, v in ticker_map.items() if k in close.columns})
+                if "Close" in data.columns:
+                    series = data["Close"].rename(t_original)
+                elif "Adj Close" in data.columns:
+                    series = data["Adj Close"].rename(t_original)
+                else:
+                    raise RuntimeError("missing_close")
 
-            close.index = pd.to_datetime(close.index)
-            close = close.sort_index()
-            close = close.loc[:, close.isna().mean() < 0.30]
-            close = close.ffill().bfill()
+                if series is not None and series.dropna().shape[0] >= 10:
+                    break
+            except Exception:
+                if attempt == 0:
+                    time.sleep(0.5)
+                    continue
 
-            report["method"] = "download"
-            report["n_ok"] = int(close.shape[1])
-            report["failed"] = [t for t in tickers if t not in close.columns]
+        if series is None or series.dropna().shape[0] < 10:
+            failed.append(t_original)
+        else:
+            results[t_original] = series
 
-            return close, report
-        except Exception as e:
-            report["method"] = f"download_failed:{type(e).__name__}"
-            if attempt == 0:
-                time.sleep(0.75)
-                continue
-
-    results = {}
-    with ThreadPoolExecutor(max_workers=min(20, len(tickers))) as ex:
-        futures = {ex.submit(_fetch_single, t, period, interval): t for t in tickers}
-        for f in as_completed(futures):
-            ticker, series = f.result()
-            if series is not None:
-                results[ticker] = series
+        # critical: slow down to reduce rate-limits in deployments
+        if sleep_seconds and i < len(tickers_yf) - 1:
+            time.sleep(float(sleep_seconds))
 
     if not results:
-        report["method"] = report["method"] or "single"
+        # Stooq fallback (no API key) for deployments where Yahoo is blocked
+        if allow_stooq_fallback:
+            stooq_results: dict[str, pd.Series] = {}
+            stooq_failed: list[str] = []
+            for i, t in enumerate(tickers):
+                s = _fetch_single_stooq(session, t, period=period, interval=interval)
+                if s is None:
+                    stooq_failed.append(t)
+                else:
+                    stooq_results[t] = s
+                if sleep_seconds and i < len(tickers) - 1:
+                    time.sleep(float(sleep_seconds))
+
+            if stooq_results:
+                df = pd.DataFrame(stooq_results)
+                df.index = pd.to_datetime(df.index)
+                df = df.sort_index()
+                df = df.loc[:, df.isna().mean() < 0.30]
+                df = df.ffill().bfill()
+                report["method"] = "stooq"
+                report["n_ok"] = int(df.shape[1])
+                report["failed"] = stooq_failed
+                return df, report
+
+            report["method"] = "download_single+stooq_failed"
+            report["n_ok"] = 0
+            report["failed"] = stooq_failed or failed or list(tickers)
+            return pd.DataFrame(), report
+
+        report["method"] = "download_single"
         report["n_ok"] = 0
-        report["failed"] = list(tickers)
+        report["failed"] = failed or list(tickers)
         return pd.DataFrame(), report
 
     df = pd.DataFrame(results)
     df.index = pd.to_datetime(df.index)
     df = df.sort_index()
-    df = df.loc[:, df.isna().mean() < 0.30]          # drop columns with >30% NaN
+    df = df.loc[:, df.isna().mean() < 0.30]
     df = df.ffill().bfill()
-    report["method"] = "single"
+
+    report["method"] = "download_single"
     report["n_ok"] = int(df.shape[1])
-    report["failed"] = [t for t in tickers if t not in df.columns]
+    report["failed"] = failed
     return df, report
 
 

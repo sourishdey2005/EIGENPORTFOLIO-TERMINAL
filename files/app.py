@@ -94,6 +94,7 @@ from data import (
     fetch_price_data, compute_log_returns, normalize_returns,
     get_rolling_volatility, get_universe_dict, get_sector,
     SECTOR_MAP_SP500,
+    generate_demo_prices,
 )
 from rmt import run_rmt, get_eigenvector_stability
 from portfolio import (
@@ -418,6 +419,15 @@ with st.sidebar:
     )
     selected_tickers = [universe_dict[n] for n in selected_names] if selected_names else [universe_dict[n] for n in default_names[:15]]
 
+    # Deployment-safe fetch limit (Yahoo Finance is rate-limited/unreliable at scale)
+    max_fetch_tickers = st.slider(
+        "Max Stocks (Fetch)",
+        5,
+        10,
+        5,
+        help="Limits how many tickers are fetched from Yahoo Finance per run (recommended for deployments).",
+    )
+
     # Compare up to 10 stocks
     st.markdown('<div class="section-header">Compare Stocks</div>', unsafe_allow_html=True)
     compare_names = st.multiselect(
@@ -465,6 +475,18 @@ with st.sidebar:
     research_mode = st.toggle("Research Mode", value=False)
     auto_insights = st.toggle("Auto Insights", value=True)
     auto_fetch_on_change = st.toggle("Auto Fetch on Change", value=True)
+    data_source = st.selectbox(
+        "Data Source",
+        ["Live (Yahoo/Stooq)", "Demo (Synthetic)"],
+        index=0,
+        help="Use Demo when running in deployments that block outbound market data.",
+    )
+    auto_demo_fallback = st.toggle(
+        "Auto Fallback to Demo",
+        value=True,
+        help="If Live fetching fails (common in deployments), automatically switch to deterministic demo data so the dashboard still works.",
+    )
+    fetch_delay_sec = st.slider("Fetch Delay (sec)", 0.0, 3.0, 2.0, step=0.5, help="Sleep between Yahoo requests to reduce rate-limits.")
     run_mc = st.toggle("Monte Carlo Simulation", value=True)
     n_mc = st.slider("MC Simulations", 500, 5000, 2000, step=500) if run_mc else 2000
 
@@ -499,42 +521,88 @@ for key in ["prices", "returns", "rmt_result", "backtest_results", "frontier", "
 
 def load_data():
     """Fetch and process all data. Updates session state."""
-    all_needed = list(set(selected_tickers + compare_tickers))
+    # Ordered + capped list for deployment stability
+    all_needed = []
+    for t in list(selected_tickers) + list(compare_tickers):
+        if t and t not in all_needed:
+            all_needed.append(t)
+    if len(all_needed) > max_fetch_tickers:
+        st.warning(f"Fetching limited to first {max_fetch_tickers} tickers (deployment-safe mode).")
+        all_needed = all_needed[:max_fetch_tickers]
     
+    use_demo = str(data_source).lower().startswith("demo")
+
     with st.spinner("Fetching market data..."):
-        result = fetch_price_data(all_needed, period=period, interval=interval)
-        if isinstance(result, tuple) and len(result) == 2:
-            prices_all, fetch_report = result
-        else:
-            prices_all = result
-            try:
-                fetched_cols = set(getattr(prices_all, "columns", []))
-            except Exception:
-                fetched_cols = set()
+        if use_demo:
+            prices_all = generate_demo_prices(all_needed, period=period, interval=interval)
             fetch_report = {
-                "method": "legacy_cache_df",
+                "method": "demo_synth",
                 "n_requested": len(all_needed),
-                "n_ok": len(fetched_cols) if fetched_cols else 0,
-                "failed": [t for t in all_needed if t not in fetched_cols],
+                "n_ok": int(prices_all.shape[1]),
+                "failed": [],
             }
+        else:
+            result = fetch_price_data(all_needed, period=period, interval=interval, sleep_seconds=float(fetch_delay_sec))
+            if isinstance(result, tuple) and len(result) == 2:
+                prices_all, fetch_report = result
+            else:
+                prices_all = result
+                try:
+                    fetched_cols = set(getattr(prices_all, "columns", []))
+                except Exception:
+                    fetched_cols = set()
+                fetch_report = {
+                    "method": "legacy_cache_df",
+                    "n_requested": len(all_needed),
+                    "n_ok": len(fetched_cols) if fetched_cols else 0,
+                    "failed": [t for t in all_needed if t not in fetched_cols],
+                }
+
+            if getattr(prices_all, "empty", True) and auto_demo_fallback:
+                demo = generate_demo_prices(all_needed, period=period, interval=interval)
+                if not demo.empty:
+                    st.warning("Live market data fetch failed in this environment. Switching to Demo (Synthetic) data.")
+                    prices_all = demo
+                    fetch_report = {
+                        "method": "demo_synth_fallback",
+                        "fallback_from": fetch_report.get("method"),
+                        "n_requested": len(all_needed),
+                        "n_ok": int(prices_all.shape[1]),
+                        "failed": [],
+                    }
+
         st.session_state["fetch_report"] = fetch_report
 
-    if prices_all.empty:
+    if getattr(prices_all, "empty", True):
         rep = st.session_state.get("fetch_report") or {}
         failed = rep.get("failed") or []
         method = rep.get("method") or "unknown"
-        st.error("❌ Failed to fetch market data from Yahoo Finance.")
+        st.error("❌ Failed to fetch market data.")
         st.caption(f"Fetch method: `{method}` | Requested: {rep.get('n_requested')} | Fetched: {rep.get('n_ok')}")
         if failed:
             st.caption("Failed tickers (sample): " + ", ".join([str(x) for x in failed[:10]]))
-        st.info("If this is a deployment: outbound access/rate-limits can block Yahoo Finance. Try fewer tickers, switch to Weekly, or re-run later.")
+        st.info("If this is a deployment: outbound access/rate-limits can block Yahoo/Stooq. Enable Demo data in the sidebar.")
         return False
 
     # Portfolio universe prices/returns
     port_tickers = [t for t in selected_tickers if t in prices_all.columns]
     if len(port_tickers) < 5:
-        st.warning(f"Only {len(port_tickers)} tickers fetched. Need ≥5 for RMT. Try different stocks or period.")
-        return False
+        if (not use_demo) and auto_demo_fallback:
+            demo = generate_demo_prices(all_needed, period=period, interval=interval)
+            if not demo.empty:
+                st.warning("Too few tickers fetched for RMT. Switching to Demo (Synthetic) data.")
+                prices_all = demo
+                port_tickers = [t for t in selected_tickers if t in prices_all.columns]
+                st.session_state["fetch_report"] = {
+                    "method": "demo_synth_fallback",
+                    "fallback_from": (st.session_state.get("fetch_report") or {}).get("method"),
+                    "n_requested": len(all_needed),
+                    "n_ok": int(prices_all.shape[1]),
+                    "failed": [],
+                }
+        if len(port_tickers) < 5:
+            st.warning(f"Only {len(port_tickers)} tickers available. Need ≥5 for RMT. Try different stocks or enable Demo data.")
+            return False
 
     prices = prices_all[port_tickers].dropna(how="all", axis=1)
     returns = compute_log_returns(prices)
@@ -599,6 +667,8 @@ def _config_signature() -> str:
         "interval": interval,
         "selected_tickers": list(selected_tickers),
         "compare_tickers": list(compare_tickers),
+        "data_source": str(data_source),
+        "auto_demo_fallback": bool(auto_demo_fallback),
         "n_signal_override": int(n_signal_override),
         "pc_index": int(pc_index),
         "top_k": int(top_k),
@@ -609,6 +679,8 @@ def _config_signature() -> str:
         "strategies_to_run": list(strategies_to_run),
         "run_mc": bool(run_mc),
         "n_mc": int(n_mc),
+        "max_fetch_tickers": int(max_fetch_tickers),
+        "fetch_delay_sec": float(fetch_delay_sec),
     }
     raw = json.dumps(cfg, sort_keys=True, default=str).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
