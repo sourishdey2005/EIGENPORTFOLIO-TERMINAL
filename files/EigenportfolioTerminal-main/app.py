@@ -15,7 +15,6 @@ import itertools
 import json
 import hashlib
 import time
-import gc
 
 _PLOTLY_CHART_COUNTER = itertools.count()
 
@@ -82,15 +81,6 @@ st.set_page_config(
 )
 
 # ─── Module Imports ───────────────────────────────────────────────────────────
-# Cache schema (prevents stale `st.cache_data` values after deploys)
-CACHE_SCHEMA_VERSION = 2
-if st.session_state.get("cache_schema_version") != CACHE_SCHEMA_VERSION:
-    try:
-        st.cache_data.clear()
-    except Exception:
-        pass
-    st.session_state["cache_schema_version"] = CACHE_SCHEMA_VERSION
-
 from data import (
     fetch_price_data, compute_log_returns, normalize_returns,
     get_rolling_volatility, get_universe_dict, get_sector,
@@ -419,15 +409,6 @@ with st.sidebar:
     )
     selected_tickers = [universe_dict[n] for n in selected_names] if selected_names else [universe_dict[n] for n in default_names[:15]]
 
-    # Deployment-safe fetch limit (live providers are rate-limited in many environments)
-    max_fetch_tickers = st.slider(
-        "Max Stocks (Fetch)",
-        5,
-        15,
-        15,
-        help="Limits how many tickers are fetched from market data providers per run (recommended for deployments).",
-    )
-
     # Compare up to 10 stocks
     st.markdown('<div class="section-header">Compare Stocks</div>', unsafe_allow_html=True)
     compare_names = st.multiselect(
@@ -475,9 +456,8 @@ with st.sidebar:
     research_mode = st.toggle("Research Mode", value=False)
     auto_insights = st.toggle("Auto Insights", value=True)
     auto_fetch_on_change = st.toggle("Auto Fetch on Change", value=True)
-    fetch_delay_sec = st.slider("Fetch Delay (sec)", 0.0, 3.0, 0.5, step=0.5, help="Sleep between Yahoo requests to reduce rate-limits.")
-    run_mc = st.toggle("Monte Carlo Simulation", value=False)
-    n_mc = st.slider("MC Simulations", 500, 5000, 1000, step=500) if run_mc else 1000
+    run_mc = st.toggle("Monte Carlo Simulation", value=True)
+    n_mc = st.slider("MC Simulations", 500, 5000, 2000, step=500) if run_mc else 2000
 
     st.markdown("---")
     fetch_btn = _button(st, "🚀  FETCH & ANALYZE", use_container_width=True)
@@ -510,65 +490,19 @@ for key in ["prices", "returns", "rmt_result", "backtest_results", "frontier", "
 
 def load_data():
     """Fetch and process all data. Updates session state."""
-    # Force garbage collection to prevent Streamlit Cloud Out-Of-Memory (OOM) errors
-    gc.collect()
-
-    # Ordered + capped list for deployment stability
-    all_needed = []
-    for t in list(selected_tickers) + list(compare_tickers):
-        if t and t not in all_needed:
-            all_needed.append(t)
-    if len(all_needed) > max_fetch_tickers:
-        all_needed = all_needed[:max_fetch_tickers]
+    all_needed = list(set(selected_tickers + compare_tickers))
     
     with st.spinner("Fetching market data..."):
-        result = fetch_price_data(
-            all_needed,
-            period=period,
-            interval=interval,
-            sleep_seconds=float(fetch_delay_sec),
-            allow_stooq_fallback=True,
-            allow_alpha_vantage_fallback=True,
-            max_alpha_calls=int(max_fetch_tickers),
-        )
-        if isinstance(result, tuple) and len(result) == 2:
-            prices_all, fetch_report = result
-        else:
-            prices_all = result
-            try:
-                fetched_cols = set(getattr(prices_all, "columns", []))
-            except Exception:
-                fetched_cols = set()
-            fetch_report = {
-                "method": "legacy_cache_df",
-                "n_requested": len(all_needed),
-                "n_ok": len(fetched_cols) if fetched_cols else 0,
-                "failed": [t for t in all_needed if t not in fetched_cols],
-            }
+        prices_all = fetch_price_data(all_needed, period=period, interval=interval)
 
-        st.session_state["fetch_report"] = fetch_report
-
-        # Detect demo fallback and notify user
-        if fetch_report.get("method") == "demo_fallback":
-            st.warning("📊 Using generated demo data (market data unavailable). Configure API keys in sidebar for live data.")
-
-    if getattr(prices_all, "empty", True):
-        rep = st.session_state.get("fetch_report") or {}
-        failed = rep.get("failed") or []
-        method = rep.get("method") or "unknown"
-        st.error("❌ Failed to fetch market data.")
-        st.caption(f"Fetch method: `{method}` | Requested: {rep.get('n_requested')} | Fetched: {rep.get('n_ok')}")
-        if rep.get("alpha_vantage_attempted"):
-            st.caption("Alpha Vantage attempted: " + ", ".join([str(x) for x in rep.get("alpha_vantage_attempted", [])[:10]]))
-        if failed:
-            st.caption("Failed tickers (sample): " + ", ".join([str(x) for x in failed[:10]]))
-        st.info("If this is a deployment: verify outbound HTTPS access and set `ALPHAVANTAGE_API_KEY` in deployment secrets. Yahoo is tried first, then Alpha Vantage.")
+    if prices_all.empty:
+        st.error("❌ Failed to fetch data. Check your tickers and internet connection.")
         return False
 
     # Portfolio universe prices/returns
     port_tickers = [t for t in selected_tickers if t in prices_all.columns]
     if len(port_tickers) < 5:
-        st.warning(f"Only {len(port_tickers)} live tickers were fetched. Need ≥5 for RMT. Try fewer symbols, a longer period, or confirm deployment network access.")
+        st.warning(f"Only {len(port_tickers)} tickers fetched. Need ≥5 for RMT. Try different stocks or period.")
         return False
 
     prices = prices_all[port_tickers].dropna(how="all", axis=1)
@@ -644,8 +578,6 @@ def _config_signature() -> str:
         "strategies_to_run": list(strategies_to_run),
         "run_mc": bool(run_mc),
         "n_mc": int(n_mc),
-        "max_fetch_tickers": int(max_fetch_tickers),
-        "fetch_delay_sec": float(fetch_delay_sec),
     }
     raw = json.dumps(cfg, sort_keys=True, default=str).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
